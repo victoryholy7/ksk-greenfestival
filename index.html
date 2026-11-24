@@ -992,14 +992,14 @@
           const check = () => {
             pollResult().then(result => {
               if (result && result.ready) resolve(result.result || {});
-              else if (++attempts < 40) setTimeout(check, 500);
+              else if (++attempts < 60) setTimeout(check, 350);
               else reject(new Error('เซิร์ฟเวอร์ยังไม่ส่งผลกลับ กรุณาลองใหม่อีกครั้ง'));
             }).catch(err => {
-              if (++attempts < 40) setTimeout(check, 500);
+              if (++attempts < 60) setTimeout(check, 350);
               else reject(err);
             });
           };
-          setTimeout(check, 450);
+          setTimeout(check, 250);
         });
       }
       function invoke(method, args, success, failure) {
@@ -1093,35 +1093,51 @@
     window.addEventListener('DOMContentLoaded', () => {
       initSkyLanterns();
       renderKrathongPreview();
+      loadCachedInitialData();
       fetchInitialDataFromServer();
       startCountdownTimer();
-      // รีเฟรชคะแนนโหวตอัตโนมัติทุก 15 วินาที เมื่อเปิดหน้าโหวตอยู่
+      // รีเฟรชคะแนนโหวตอัตโนมัติทุก 30 วินาที เมื่อเปิดหน้าโหวตอยู่และแท็บไม่ถูกซ่อน
       setInterval(() => {
         const s = document.getElementById('section-vote');
-        if (s && !s.classList.contains('hidden')) refreshVoteBoard();
-      }, 15000);
+        if (!document.hidden && s && !s.classList.contains('hidden')) refreshVoteBoard();
+      }, 30000);
     });
+
+    function applyInitialData(res) {
+      APP_STATE.settings = { ...APP_STATE.settings, ...res.settings };
+      APP_STATE.krathongs = res.krathongs || [];
+      APP_STATE.wishes = res.wishes || [];
+      APP_STATE.voteBoard = res.voteBoard || { top: [], counts: {}, totalVotes: 0 };
+
+      document.getElementById('ui-event-title').textContent = APP_STATE.settings.EVENT_TITLE;
+      document.getElementById('ui-announcement').textContent = APP_STATE.settings.ANNOUNCEMENT;
+      document.getElementById('stat-total-krathongs').textContent = res.stats.totalKrathongs.toLocaleString();
+      document.getElementById('stat-total-participants').textContent = res.stats.totalParticipants.toLocaleString();
+      document.getElementById('wishes-total-badge').textContent = res.stats.totalWishes.toLocaleString();
+
+      spawnRandomRiverBatch();
+      renderGallery();
+      renderWishesSection();
+      renderVotePage();
+    }
+
+    // แสดงข้อมูลรอบก่อนหน้าทันทีที่เปิดเว็บ แล้วค่อยอัปเดตเมื่อเซิร์ฟเวอร์ตอบกลับ
+    function loadCachedInitialData() {
+      try {
+        const raw = localStorage.getItem('ksk_init_cache_v1');
+        if (!raw) return;
+        const res = JSON.parse(raw);
+        if (res && res.success) applyInitialData(res);
+      } catch (e) {}
+    }
 
     function fetchInitialDataFromServer() {
       if (typeof google !== 'undefined' && google.script && google.script.run) {
         google.script.run
           .withSuccessHandler((res) => {
             if (res && res.success) {
-              APP_STATE.settings = { ...APP_STATE.settings, ...res.settings };
-              APP_STATE.krathongs = res.krathongs || [];
-              APP_STATE.wishes = res.wishes || [];
-              APP_STATE.voteBoard = res.voteBoard || { top: [], counts: {}, totalVotes: 0 };
-
-              document.getElementById('ui-event-title').textContent = APP_STATE.settings.EVENT_TITLE;
-              document.getElementById('ui-announcement').textContent = APP_STATE.settings.ANNOUNCEMENT;
-              document.getElementById('stat-total-krathongs').textContent = res.stats.totalKrathongs.toLocaleString();
-              document.getElementById('stat-total-participants').textContent = res.stats.totalParticipants.toLocaleString();
-              document.getElementById('wishes-total-badge').textContent = res.stats.totalWishes.toLocaleString();
-
-              spawnRandomRiverBatch();
-              renderGallery();
-              renderWishesSection();
-              renderVotePage();
+              try { localStorage.setItem('ksk_init_cache_v1', JSON.stringify(res)); } catch (e) {}
+              applyInitialData(res);
             }
           })
           .withFailureHandler((err) => {
@@ -1717,28 +1733,45 @@
 
     function voteForWish(krathongId, btn) {
       if (getVoteStatus() !== 'open') { renderVotePage(); return; }
-      if (hasVoted()) { Swal.fire({ icon: 'info', title: 'ใช้สิทธิ์โหวตแล้ว', text: 'อุปกรณ์นี้สามารถโหวตได้ 1 ครั้งตลอดกิจกรรม' }); return; }
-      if (btn) { btn.disabled = true; btn.innerHTML = '<i class="fa-solid fa-spinner fa-spin mr-1"></i>กำลังบันทึก'; }
+      if (hasVoted() || window._voting) { Swal.fire({ icon: 'info', title: 'ใช้สิทธิ์โหวตแล้ว', text: 'อุปกรณ์นี้สามารถโหวตได้ 1 ครั้งตลอดกิจกรรม' }); return; }
+      window._voting = true;
       const voterToken = getVoterToken();
+      const target = APP_STATE.krathongs.find(k => String(k.id) === String(krathongId));
+      const wish = APP_STATE.wishes.find(w => String(w.krathongId) === String(krathongId));
+      const prevT = target ? target.voteCount : undefined;
+      const prevW = wish ? wish.voteCount : undefined;
+
+      // อัปเดตหน้าจอทันที (optimistic) เพื่อให้รู้สึกว่าระบบตอบสนองเร็ว แล้วค่อยยืนยันกับเซิร์ฟเวอร์
+      if (target) target.voteCount = (Number(target.voteCount) || 0) + 1;
+      if (wish) wish.voteCount = (Number(wish.voteCount) || 0) + 1;
+      try { localStorage.setItem('ksk_voted_wish_once_v1', 'yes'); } catch (e) {}
+      renderVotePage();
+
+      const revert = (clearFlag) => {
+        window._voting = false;
+        if (target) target.voteCount = prevT;
+        if (wish) wish.voteCount = prevW;
+        if (clearFlag) { try { localStorage.removeItem('ksk_voted_wish_once_v1'); } catch (e) {} }
+        renderVotePage();
+        refreshVoteBoard();
+      };
+
       google.script.run.withSuccessHandler(res => {
         if (res && res.success) {
-          try { localStorage.setItem('ksk_voted_wish_once_v1', 'yes'); } catch (e) {}
-          const target = APP_STATE.krathongs.find(k => String(k.id) === String(krathongId));
-          const wish = APP_STATE.wishes.find(w => String(w.krathongId) === String(krathongId));
+          window._voting = false;
           if (target) target.voteCount = res.voteCount;
           if (wish) wish.voteCount = res.voteCount;
           Swal.fire({ icon: 'success', title: 'ขอบคุณที่ร่วมโหวต', text: 'บันทึกคะแนนของคุณเรียบร้อยแล้ว', confirmButtonColor: '#059669' });
           renderVotePage();
           refreshVoteBoard();
         } else {
-          if (res && res.code === 'ALREADY_VOTED') { try { localStorage.setItem('ksk_voted_wish_once_v1', 'yes'); } catch (e) {} }
+          // ถ้าเซิร์ฟเวอร์บอกว่าอุปกรณ์นี้โหวตไปแล้ว ให้คงสถานะ "ใช้สิทธิ์แล้ว" ไว้
+          revert(!(res && res.code === 'ALREADY_VOTED'));
           Swal.fire({ icon: 'info', title: 'ไม่สามารถโหวตได้', text: (res && res.message) || 'กรุณาลองใหม่อีกครั้ง' });
-          renderVotePage();
         }
       }).withFailureHandler(err => {
+        revert(true);
         Swal.fire({ icon: 'error', title: 'บันทึกคะแนนไม่สำเร็จ', text: (err && err.message) || 'กรุณาลองใหม่อีกครั้ง' });
-        renderVotePage();
-        refreshVoteBoard();
       }).castWishVote(krathongId, voterToken);
     }
 
